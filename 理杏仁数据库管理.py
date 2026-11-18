@@ -569,7 +569,10 @@ def _translate_formula(expr: str, metric_map=None) -> str:
     """把 [table.field.vt] 翻译成 '期末值 营业收入' 这种可读文本。"""
     mm = metric_map if metric_map is not None else METRIC_MAP
     def _repl(m):
-        tn, fn, vt = m.group(1), m.group(2), m.group(3)
+        tn = m.group(1).strip()
+        fn, vt = _split_field_vt(m.group(2))
+        if not fn:
+            return m.group(0)
         lbl = _VT_LABELS.get(vt)
         if lbl is None and vt.startswith("y") and vt[1:].isdigit():
             lbl = f"{vt[1:]}年前同期"
@@ -578,7 +581,7 @@ def _translate_formula(expr: str, metric_map=None) -> str:
         if tn == "formula":
             return f"{lbl}「{fn}」（自定义）"
         return f"{lbl} {mm.get((tn, fn), fn)}"
-    return re.sub(r'\[([^\s\[\].]+)\.([^\s\[\].]+)\.([^\s\[\].]+)\]', _repl, expr)
+    return re.sub(r'\[\s*([^\s\[\].]+)\s*\.\s*([^\s\[\]]+?)\s*\]', _repl, expr)
 
 def _render_custom_table(pivot, periods, field_order, show_types,
                          hl_up, hl_down, table_name, companies, company_name="", period_links=None,
@@ -1541,7 +1544,11 @@ def _preprocess_formula(s: str):
 
     def _ref_repl(m):
         i = len(refs)
-        refs.append(("ref", (m.group(1), m.group(2), m.group(3))))
+        t = m.group(1).strip()
+        f, vt = _split_field_vt(m.group(2))
+        if not f:
+            return m.group(0)
+        refs.append(("ref", (t, f, vt)))
         return f"_R{i}_"
 
     s = re.sub(
@@ -1550,8 +1557,7 @@ def _preprocess_formula(s: str):
         _range_repl, s,
     )
     s = re.sub(
-        r'\[\s*([^\s\[\].]+)\s*\.\s*([^\s\[\].]+)\s*\.\s*'
-        r'([^\s\[\].]+)\s*\]',
+        r'\[\s*([^\s\[\].]+)\s*\.\s*([^\s\[\]]+?)\s*\]',
         _ref_repl, s,
     )
 
@@ -1961,6 +1967,23 @@ def _run_formula(code, refs, get_cell, get_range):
         return eval(code, _FORMULA_GLOBALS, locals_ns)
     except Exception:
         return None
+
+_VT_WHITELIST = frozenset({"t", "ttm", "c", "q1", "q2", "q4", "avg", ""})
+
+def _split_field_vt(body: str):
+    """把 'field' 或 'field.vt' 拆开，支持 field 含点。
+       'oi.t'                    -> ('oi', 't')
+       'pe_ttm.y10.cvpos.t'      -> ('pe_ttm.y10.cvpos', 't')
+       'pe_ttm.y10.cvpos'        -> ('pe_ttm.y10.cvpos', '')
+       'foo.y3'                  -> ('foo', 'y3')
+       'tr_dri.cagr_p_r_fys.ttm' -> ('tr_dri.cagr_p_r_fys', 'ttm')"""
+    body = body.strip()
+    if "." in body:
+        head, tail = body.rsplit(".", 1)
+        tail = tail.strip()
+        if tail in _VT_WHITELIST or (len(tail) >= 2 and tail[0] == "y" and tail[1:].isdigit()):
+            return head.strip(), tail
+    return body, ""
 
 _KNOWN_VT = frozenset({"q1", "q4", "avg", "ttm", "q2", "c", "t", ""})
 def _eval_formula(formula, pivot, period, company, expr_type="t"):
@@ -3299,19 +3322,24 @@ if active_tab == _TAB_LABELS[0]:
             }
 
             def _repl_ref(m):
-                _tn, _fn, _vt = m.group(1), m.group(2), m.group(3)
+                _tn = m.group(1).strip()
+                _fn, _vt = _split_field_vt(m.group(2))
+                if not _fn:
+                    return m.group(0)
+                    
                 _lbl = _VT_LABELS.get(_vt)
                 if _lbl is None and _vt.startswith("y") and _vt[1:].isdigit():
                     _lbl = f"{_vt[1:]}年前同期"
                 if _lbl is None:
                     _lbl = f"未知({_vt})"     # 显式提示写错后缀
+                    
                 if _tn == "formula":
                     return f"{_lbl}「{_fn}」（自定义公式）"
                 _nm = METRIC_MAP.get((_tn, _fn), _fn)
-                return f"{_lbl} {_nm}"
+                return f"{_lbl} {_nm}".strip()
 
             _desc = re.sub(
-                r'\[([^\s\[\].]+)\.([^\s\[\].]+)\.([^\s\[\].]+)\]',
+                r'\[\s*([^\s\[\].]+)\s*\.\s*([^\s\[\]]+?)\s*\]',
                 _repl_ref, _scr_f_expr)
             st.markdown(
                 f"<div style='background:#f8f9fa; padding:10px; border-radius:4px; "
@@ -4961,14 +4989,20 @@ def _metric_settings_dialog(con, group_id, table_name, granularity, owner_type, 
             with col_desc:
                 if f_expr:
                     def repl(match):
-                        tn, fn, vt = match.group(1), match.group(2), match.group(3)
-                        vt_map = {"q1": "期初值", "q4": "期末值", "avg": "平均值", "ttm": "TTM值"}
+                        tn = match.group(1).strip()
+                        fn, vt = _split_field_vt(match.group(2))
+                        if not fn:
+                            return match.group(0)
+                            
+                        # 顺手补齐 t 和 c 的翻译
+                        vt_map = {"t": "累计", "c": "单季", "q1": "期初值", "q4": "期末值", "avg": "平均值", "ttm": "TTM值"}
                         if tn == "formula":
                             return f"{vt_map.get(vt, vt)}「{fn}」（自定义公式）"
                         nm = name_map.get((tn, fn), fn)
-                        return f"{vt_map.get(vt, vt)} {nm}"
+                        return f"{vt_map.get(vt, vt)} {nm}".strip()
+                        
                     desc = re.sub(
-                        r'\[([^\s\[\].]+)\.([^\s\[\].]+)\.([^\s\[\].]+)\]',
+                        r'\[\s*([^\s\[\].]+)\s*\.\s*([^\s\[\]]+?)\s*\]',
                         repl, f_expr)
                     st.markdown(f"<div style='background:#f8f9fa; padding:10px; border-radius:4px; font-size:14px;'>详情：{desc}</div>", unsafe_allow_html=True)
                 
@@ -5486,6 +5520,52 @@ def _cf_build_L2(cur, sel_comps, comp_head, granularity, owner_type,
             if v is None or pd.isna(v): v = raw
         except Exception: pass
         _pivot_set(pivot, f"{t}.{f}", c, p, et, {"value": v, "raw": raw})
+
+    # 历史财报公式也允许引用 pm/hm 的最新快照。
+    # 只加载当前公式/指标涉及的字段，并把快照值映射到本次查询的所有报告期。
+    if granularity != "latest":
+        latest_fields = sorted(
+            (t, f) for t, f in involved_fields if t in ("pm", "hm")
+        )
+        if latest_fields:
+            latest_pairs_ph = ",".join(["(?,?)"] * len(latest_fields))
+            latest_field_flat = [x for pair in latest_fields for x in pair]
+            latest_df = cur.execute(
+                f"""
+                WITH ranked AS (
+                    SELECT stock_code, table_name, field_name, value, value_raw,
+                           row_number() OVER (
+                               PARTITION BY stock_code, table_name, field_name
+                               ORDER BY report_period DESC
+                           ) AS rn
+                    FROM {TABLE}
+                    WHERE granularity = 'latest'
+                      AND stock_code IN ({stock_in})
+                      AND (table_name, field_name) IN ({latest_pairs_ph})
+                )
+                SELECT stock_code, table_name, field_name, value, value_raw
+                FROM ranked
+                WHERE rn = 1
+                """,
+                list(sel_comps) + latest_field_flat,
+            ).df()
+
+            for c, t, f, v, raw in latest_df.itertuples(index=False, name=None):
+                c, t, f = _safe_str(c), _safe_str(t), _safe_str(f)
+                try:
+                    if v is None or pd.isna(v):
+                        v = raw
+                except Exception:
+                    pass
+
+                key = f"{t}.{f}"
+                for p in query_periods:
+                    pdat = pivot.setdefault(key, {}).setdefault(c, {}).setdefault(p, {})
+                    cell = {"value": v, "raw": raw}
+                    # q4 在 t/c/ttm 语境下分别读取这些表达式类型。
+                    # 仅填空位，避免覆盖数据库中已有的历史值。
+                    for et in ("t", "c", "ttm"):
+                        pdat.setdefault(et, cell)
 
     _show_set = set(show_types or [])
     _formula_needs_ttm = False
